@@ -14,6 +14,7 @@ import type { Logger } from "../logger";
 import { TextAccumulator } from "../utils/textAccumulator";
 import type { PendingToolCall, ToolCallCapture } from "./toolBridge";
 import { HttpError } from "../errors";
+import { markExhausted, markRecovered, looksLikeQuotaError, fallbackChainFor } from "./quotaState";
 import type { CursorAgentModeOption } from "../config";
 
 export type RunFinishReason = "stop" | "tool_calls" | "cancelled";
@@ -62,6 +63,53 @@ type StreamRace =
   | { kind: "tool"; call: PendingToolCall };
 
 export async function runTurn(params: RunTurnParams): Promise<RunOutcome> {
+  const requested = params.model;
+  const requestedId = requested.id;
+  const candidates = [requestedId, ...fallbackChainFor(requestedId)];
+  const emission = { emitted: false };
+  const guardedSink: RunSink | undefined = params.sink
+    ? {
+        onTextDelta: (delta) => { emission.emitted = true; params.sink?.onTextDelta?.(delta); },
+        onReasoningDelta: (delta) => { emission.emitted = true; params.sink?.onReasoningDelta?.(delta); },
+        onToolCallStarted: (call) => { emission.emitted = true; params.sink?.onToolCallStarted?.(call); },
+      }
+    : undefined;
+
+  let lastErr: unknown;
+  for (let i = 0; i < candidates.length; i++) {
+    const candidateId = candidates[i]!;
+    const candidateModel: ModelSelection = i === 0 ? requested : { id: candidateId };
+    try {
+      const outcome = await runTurnOnce({ ...params, model: candidateModel, sink: guardedSink });
+      if (i === 0) {
+        // Success on the requested model proves the quota is back (if it was marked).
+        markRecovered(requestedId, params.log);
+      } else {
+        params.log.warn({ requested: requestedId, served: candidateId }, "quota failover: served fallback model");
+      }
+      return outcome;
+    } catch (err) {
+      lastErr = err;
+      const msg = err instanceof Error ? err.message : String(err);
+      const failedId = candidates[i]!;
+      if (looksLikeQuotaError(msg) && i + 1 < candidates.length && !emission.emitted) {
+        markExhausted(failedId, msg, params.log);
+        params.log.warn(
+          { requested: requestedId, failed: failedId, fallbacks: candidates.slice(i + 1) },
+          "quota exhausted -> failover chain",
+        );
+        continue;
+      }
+      if (i === 0 && looksLikeQuotaError(msg)) {
+        markExhausted(requestedId, msg, params.log);
+      }
+      throw err;
+    }
+  }
+  throw lastErr;
+}
+
+async function runTurnOnce(params: RunTurnParams): Promise<RunOutcome> {
   const { agent, message, model, agentMode, customTools, toolCapture, includeThinking, timeoutMs, sink, log, abortSignal } = params;
 
   const run: Run = await agent.send(message, {
@@ -148,9 +196,11 @@ export async function runTurn(params: RunTurnParams): Promise<RunOutcome> {
   }
 
   if (!capturedToolCall && result?.status === "error") {
+    const detail = typeof result.result === "string" && result.result.trim() ? ` Detail: ${result.result.slice(0, 300)}` : "";
     throw HttpError.internal(
       `Cursor agent run ${run.id} (agent ${run.agentId}) finished with status "error". ` +
-        "Inspect this run in the Cursor dashboard or via Agent.getRun() for details.",
+        "Inspect this run in the Cursor dashboard or via Agent.getRun() for details." +
+        detail,
     );
   }
 

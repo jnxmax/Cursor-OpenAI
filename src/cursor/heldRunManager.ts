@@ -2,6 +2,7 @@ import type { ModelSelection, Run, SDKAgent, SDKCustomTool, SDKMessage, SDKUserM
 import type { Logger } from "../logger";
 import { TextAccumulator } from "../utils/textAccumulator";
 import { consumeSdkMessage, type RunSink } from "./runController";
+import { markExhausted, looksLikeQuotaError } from "./quotaState";
 import type { HeldToolGate, HeldToolCall, HeldToolResult } from "./heldToolGate";
 import { HttpError } from "../errors";
 import type { CursorAgentModeOption } from "../config";
@@ -306,10 +307,15 @@ export class HeldRunManager {
       this.settle(state);
 
       if (result?.status === "error") {
-        throw HttpError.internal(
-          `Cursor agent run ${run.id} (agent ${run.agentId}) finished with status "error". ` +
-            "Inspect this run in the Cursor dashboard or via Agent.getRun() for details.",
-        );
+        const detail = typeof result.result === "string" ? result.result : "";
+        const errText = `Cursor agent run ${run.id} (agent ${run.agentId}) finished with status "error".` +
+          (detail.trim() ? ` Detail: ${detail.slice(0, 300)}` : "");
+        // Subscription model ran out of quota: record it so the picker greys
+        // the row and the next request fails over before spending a run.
+        if (looksLikeQuotaError(errText)) {
+          markExhausted(run.model?.id ?? "", errText, log);
+        }
+        throw HttpError.internal(errText);
       }
 
       return {

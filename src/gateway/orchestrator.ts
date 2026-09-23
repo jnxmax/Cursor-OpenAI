@@ -10,6 +10,7 @@ import type { HeldRunManager, HeldRunSegment } from "../cursor/heldRunManager";
 import type { ResponseStore } from "../cursor/responseStore";
 import { extractImages, extractSystemPrompt, prepareTurn } from "../translate/requestTranslator";
 import { runTurn, type RunOutcome, type RunSink } from "../cursor/runController";
+import { isExhausted, fallbackChainFor } from "../cursor/quotaState";
 import { buildChatCompletionResponse } from "../translate/responseTranslator";
 import type { ChatCompletionMessage, ChatCompletionRequestMetadata, ChatCompletionTool } from "../types/openai";
 import { HttpError } from "../errors";
@@ -143,6 +144,20 @@ export async function prepareGatewayTurn(
   const model = await modelCatalog.resolveModelSelection(apiKey, requestedModelId, config.defaultModel);
   log.info({ requestedModelId, modelSelection: model, formatted: formatModelSelection(model) }, "resolved Cursor model selection");
 
+  // Quota pre-check: if the requested subscription model is marked exhausted,
+  // serve the next fallback in the chain directly (no wasted Cursor run).
+  let effectiveModel = model;
+  if (model.id && isExhausted(model.id)) {
+    const chain = fallbackChainFor(model.id);
+    if (chain.length > 0) {
+      log.warn({ requested: model.id, served: chain[0] }, "quota exhausted (pre-check) -> serving fallback");
+      effectiveModel = { id: chain[0]! };
+    } else {
+      log.warn({ requested: model.id }, "quota exhausted (pre-check) but no fallback available; attempting anyway");
+    }
+  }
+  const modelSelection = effectiveModel;
+
   // Continuation of a held run? Then there's no new agent turn to prepare -
   // we resume the run that's already open. The held run still owns its
   // session mutex from the original request, so we do NOT take a semaphore
@@ -155,8 +170,8 @@ export async function prepareGatewayTurn(
       requestId,
       endpoint,
       requestedModelId,
-      resolvedModelId: model.id,
-      modelSelection: model,
+      resolvedModelId: modelSelection.id,
+      modelSelection,
       messages: rest,
       handle: undefined as unknown as SessionHandle,
       turnMessage: "",
@@ -184,7 +199,7 @@ export async function prepareGatewayTurn(
 
   let handle: SessionHandle;
   try {
-    handle = await sessionManager.resolve({ apiKey, model, messages: rest, metadata });
+    handle = await sessionManager.resolve({ apiKey, model: modelSelection, messages: rest, metadata });
   } catch (err) {
     releaseSemaphore();
     throw err;
@@ -219,8 +234,8 @@ export async function prepareGatewayTurn(
     requestId,
     endpoint,
     requestedModelId,
-    resolvedModelId: model.id,
-    modelSelection: model,
+    resolvedModelId: modelSelection.id,
+    modelSelection,
     messages: rest,
     handle,
     turnMessage,

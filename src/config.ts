@@ -72,6 +72,7 @@ export interface AppConfig {
   corsOrigin: string;
   cursorRuntime: CursorRuntimeKind;
   cursorWorkdirRoot: string;
+  cursorNativeRestartHelper?: string;
   cursorAgentMode: CursorAgentModeOption;
   defaultModel: string;
   includeThinking: boolean;
@@ -209,6 +210,7 @@ export function loadConfig(): AppConfig {
     corsOrigin: optionalString("CORS_ORIGIN", "*"),
     cursorRuntime: validateRuntime(optionalString("CURSOR_RUNTIME", "local")),
     cursorWorkdirRoot,
+    cursorNativeRestartHelper: process.env["CURSOR_NATIVE_RESTART_HELPER"] || undefined,
     cursorAgentMode: validateAgentMode(optionalString("CURSOR_AGENT_MODE", "agent")),
     defaultModel: requireString("DEFAULT_MODEL", "composer-2.5"),
     includeThinking: optionalBool("CURSOR_INCLUDE_THINKING", true),

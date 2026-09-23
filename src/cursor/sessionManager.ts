@@ -2,12 +2,13 @@ import path from "node:path";
 import fs from "node:fs";
 import { createHash } from "node:crypto";
 import { Agent } from "@cursor/sdk";
-import type { SDKAgent, ModelSelection } from "@cursor/sdk";
+import type { SDKAgent, ModelSelection, LocalAgentOptions } from "@cursor/sdk";
 import type { AppConfig } from "../config";
 import type { Logger } from "../logger";
 import type { ChatCompletionMessage, ChatCompletionRequestMetadata } from "../types/openai";
 import { computeNewSuffix, hashMessages, modelSelectionKey } from "../utils/hash";
 import { Mutex } from "../utils/concurrency";
+import { findNativeWorkspace, installNativeLifecycleHook, rememberNativeWorkspace } from "./nativeLifecycle";
 
 export interface SessionHandle {
   agent: SDKAgent;
@@ -98,8 +99,16 @@ export class SessionManager {
       const cached = this.entries.get(key);
       if (cached) return this.toHandle(key, cached, messages);
 
-      const agent = await Agent.resume(resumeId, { apiKey });
-      const cwd = this.ensureCwd(key);
+      const nativeCwd = this.config.cursorRuntime === "local" && this.config.cursorNativeRestartHelper
+        ? findNativeWorkspace(this.nativeWorkspaceAlias(apiKey, resumeId), this.log) : undefined;
+      if (!nativeCwd && this.config.cursorRuntime === "local" && this.config.cursorNativeRestartHelper) {
+        this.log.warn("Unknown native resume workspace; retaining SDK defaults without hook guarantee");
+      }
+      const cwd = nativeCwd ?? this.ensureCwd(key);
+      const agent = await Agent.resume(resumeId,
+        nativeCwd
+          ? { apiKey, model, mode: this.config.cursorAgentMode, local: this.localOptions(nativeCwd) }
+          : { apiKey });
       // A resumed agent already has real history on Cursor's side even
       // though we've never seen it locally - treat every message the client
       // sends as new content for this turn rather than "cold replay" history.
@@ -203,6 +212,7 @@ export class SessionManager {
   }
 
   private toHandle(key: string, entry: SessionEntry, messages: ChatCompletionMessage[]): SessionHandle {
+    this.localOptions(entry.cwd);
     entry.lastUsedAt = Date.now();
     return {
       agent: entry.agent,
@@ -232,16 +242,29 @@ export class SessionManager {
       model,
       name: "cursor-openai-gateway",
       mode: this.config.cursorAgentMode,
-      local:
-        this.config.cursorRuntime === "local"
-          ? { cwd, settingSources: [], enableAgentRetries: true }
-          : undefined,
+      local: this.localOptions(cwd),
       cloud: this.config.cursorRuntime === "cloud" ? {} : undefined,
     });
+    if (this.config.cursorRuntime === "local" && this.config.cursorNativeRestartHelper) {
+      rememberNativeWorkspace({ cwd, alias: this.nativeWorkspaceAlias(apiKey, agent.agentId), log: this.log });
+    }
     const entry: SessionEntry = { agent, mutex: new Mutex(), cwd, lastUsedAt: Date.now(), createdAt: Date.now(), lastMessages: [] };
     this.entries.set(key, entry);
     this.enforceCapacity();
     return entry;
+  }
+
+  private nativeWorkspaceAlias(apiKey: string, agentId: string): string {
+    return path.join(this.config.cursorWorkdirRoot, `.native-resume-${shortHash(`resume:${shortHash(apiKey)}:${agentId}`)}`);
+  }
+
+  private localOptions(cwd: string): LocalAgentOptions | undefined {
+    if (this.config.cursorRuntime !== "local") return undefined;
+    const installed = installNativeLifecycleHook({ cwd, helper: this.config.cursorNativeRestartHelper, log: this.log });
+    return {
+      cwd, settingSources: installed ? ["project"] : [], enableAgentRetries: true,
+      ...(installed ? { autoReview: false, sandboxOptions: { enabled: false } } : {}),
+    };
   }
 
   private ensureCwd(key: string): string {

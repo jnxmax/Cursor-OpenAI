@@ -147,61 +147,42 @@ async function main(): Promise<void> {
   }
 
   let shuttingDown = false;
-  const shutdown = (signal: string): void => {
+  const shutdown = (signal: string, restart = false): void => {
     if (shuttingDown) return;
     shuttingDown = true;
     log.info({ signal }, "shutting down");
+    // The deadline is a failure path, never a claim that async cleanup finished.
+    const deadline = setTimeout(() => {
+      log.error({ sessions: sessionManager.stats() }, "graceful shutdown timed out; forcing exit with outstanding owners");
+      process.exit(1);
+    }, 10_000);
+    const httpClosed = new Promise<void>((resolve, reject) => {
+      server.close((err) => { if (err) reject(err); else resolve(); });
+    });
     heldRunManager.shutdown();
     responseStore.shutdown();
-    server.close(() => {
-      sessionManager.shutdown();
+    // Close admission immediately, including requests waiting to resolve a session.
+    void Promise.all([httpClosed, sessionManager.shutdown()]).then(() => {
+      clearTimeout(deadline);
+      if (restart) {
+        const child = spawn(process.execPath, process.argv.slice(1), {
+          detached: true, stdio: "inherit", cwd: process.cwd(), env: process.env,
+        });
+        child.unref();
+      }
       log.info("shutdown complete");
       process.exit(0);
-    });
-    // Force-exit if graceful shutdown hangs (e.g. a stuck local agent process).
-    setTimeout(() => {
-      log.warn("graceful shutdown timed out, forcing exit");
-      heldRunManager.shutdown();
-      responseStore.shutdown();
-      sessionManager.shutdown();
+    }).catch((err: unknown) => {
+      clearTimeout(deadline);
+      log.error({ err }, "shutdown failed; cleanup was not complete");
       process.exit(1);
-    }, 10_000).unref();
+    });
   };
 
   configStore.onRestartRequested(() => {
     if (shuttingDown) return;
-    shuttingDown = true;
-    log.info("restart requested via admin dashboard/CLI - respawning the process");
-    // A short delay so the HTTP response for the request that triggered
-    // this (POST /api/admin/restart) has actually flushed to the client
-    // before we start tearing anything down - otherwise that caller would
-    // see a connection reset instead of the "restarting" confirmation.
-    setTimeout(() => {
-      // `process.argv.slice(1)` reproduces exactly however this process was
-      // originally launched (`node dist/index.js`, `tsx watch src/index.ts`,
-      // etc.) - whatever it is, respawning it is correct, since it's just
-      // "run this same command again". `detached: true` + `unref()` lets the
-      // child outlive this process once it exits below, and `stdio:
-      // "inherit"` keeps its logs going to the same console/log file this
-      // process was using.
-      const child = spawn(process.execPath, process.argv.slice(1), {
-        detached: true,
-        stdio: "inherit",
-        cwd: process.cwd(),
-        env: process.env,
-      });
-      child.unref();
-      heldRunManager.shutdown();
-      responseStore.shutdown();
-      // Deliberately not awaiting server.close()'s drain callback (same
-      // reasoning as the port/host rebind above): the process is about to
-      // exit outright, which releases the listening socket immediately at
-      // the OS level - no need to wait for in-flight keep-alive connections
-      // to idle out first.
-      server.close();
-      sessionManager.shutdown();
-      process.exit(0);
-    }, 300);
+    // Allow the requesting HTTP response to flush, then use the same drain as SIGTERM.
+    setTimeout(() => shutdown("admin restart", true), 300);
   });
 
   process.on("SIGINT", () => shutdown("SIGINT"));

@@ -93,6 +93,8 @@ export interface StartHeldRunParams {
 
 export class HeldRunManager {
   private readonly held = new Map<string, HeldRunState>();
+  private readonly active = new Set<HeldRunState>();
+  private closing = false;
   private readonly byToolCallId = new Map<string, string>();
 
   constructor(private readonly log: Logger) {}
@@ -116,6 +118,7 @@ export class HeldRunManager {
   }
 
   async start(params: StartHeldRunParams): Promise<HeldRunSegment> {
+    if (this.closing) throw new Error("Held runs are shutting down");
     const run: Run = await params.agent.send(params.message, {
       model: params.model,
       mode: params.agentMode,
@@ -145,6 +148,11 @@ export class HeldRunManager {
       settled: false,
     };
 
+    this.active.add(state);
+    if (this.closing) {
+      this.teardown(state, "shutdown during send");
+      throw new Error("Held runs are shutting down");
+    }
     this.armAbort(state);
     return this.pump(state, params.sink);
   }
@@ -193,8 +201,9 @@ export class HeldRunManager {
   }
 
   shutdown(): void {
-    for (const [agentId, state] of [...this.held]) {
-      this.forget(agentId);
+    this.closing = true;
+    for (const state of [...this.active]) {
+      this.forget(state.agentId);
       this.teardown(state, "server shutdown");
     }
   }
@@ -256,7 +265,7 @@ export class HeldRunManager {
       // Client disconnected mid-segment: teardown already ran via the abort
       // listener; report a cancelled segment (nobody is reading the response,
       // but callers use this to skip session bookkeeping, mirroring legacy).
-      if (state.abortSignal?.aborted) {
+      if (state.settled || state.abortSignal?.aborted) {
         return {
           status: "cancelled",
           content: textAcc.current,
@@ -350,6 +359,7 @@ export class HeldRunManager {
     };
     state.onAbort = onAbort;
     state.abortSignal.addEventListener("abort", onAbort, { once: true });
+    if (state.abortSignal.aborted) onAbort();
   }
 
   private disarmAbort(state: HeldRunState): void {
@@ -375,6 +385,7 @@ export class HeldRunManager {
   private settle(state: HeldRunState): void {
     if (state.settled) return;
     state.settled = true;
+    this.active.delete(state);
     if (state.timeoutHandle) clearTimeout(state.timeoutHandle);
     this.disarmAbort(state);
     this.safeRelease(state);
@@ -384,10 +395,12 @@ export class HeldRunManager {
   private teardown(state: HeldRunState, reason: string): void {
     if (state.settled) return;
     state.settled = true;
+    this.active.delete(state);
     if (state.timeoutHandle) clearTimeout(state.timeoutHandle);
     this.disarmAbort(state);
     state.gate.close();
-    state.run.cancel().catch((err: unknown) => state.log.debug({ err, runId: state.runId, reason }, "held-run cancel failed"));
+    // SessionLifetime retains the SDK run until wait/conversation actually settle.
+    void state.run.cancel().catch((err: unknown) => state.log.error({ err, runId: state.runId, reason }, "held-run cancel failed"));
     this.safeRelease(state);
     this.log.debug({ agentId: state.agentId, runId: state.runId, reason }, "held run torn down");
   }
@@ -396,7 +409,7 @@ export class HeldRunManager {
     try {
       state.onRelease();
     } catch (err) {
-      this.log.debug({ err, agentId: state.agentId }, "held-run onRelease threw (ignored)");
+      this.log.error({ err, agentId: state.agentId }, "held-run onRelease failed");
     }
   }
 }

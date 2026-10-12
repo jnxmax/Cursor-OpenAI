@@ -2,6 +2,14 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { AppConfig } from "../../src/config";
+import type { SessionManager, SessionHandle } from "../../src/cursor/sessionManager";
+
+/** Cache-only tests finish the request reservation without starting an SDK run. */
+export async function resolveIdleSession(manager: SessionManager, params: Parameters<SessionManager["resolve"]>[0]): Promise<SessionHandle> {
+  const handle = await manager.resolve(params);
+  handle.release();
+  return handle;
+}
 
 /** Builds a fully-populated `AppConfig` for tests, with sane defaults and a fresh, uniquely-named scratch data dir per call (isolating any ConfigStore settings.json writes too - see ConfigStore's constructor). */
 export function makeTestConfig(overrides: Partial<AppConfig> = {}): AppConfig {
@@ -41,4 +49,22 @@ export function makeTestConfig(overrides: Partial<AppConfig> = {}): AppConfig {
     allowedModels: "",
     ...overrides,
   };
+}
+
+function projectSlug(workspaceRef: string): string {
+  return workspaceRef.replace(/[^a-zA-Z0-9]/g, "-").replace(/-+/g, "-").replace(/^-+|-+$/g, "");
+}
+
+/** Deletes only SDK project dirs created for an isolated `cursor-gw-test` workspace. */
+export function removeIsolatedCursorProjects(workdirRoot: string): void {
+  const dataDir = path.dirname(workdirRoot);
+  if (!path.basename(dataDir).startsWith("cursor-gw-test-")) return;
+  if (fs.existsSync(workdirRoot)) {
+    for (const name of fs.readdirSync(workdirRoot)) {
+      const slug = projectSlug(path.join(workdirRoot, name));
+      if (!slug.includes("cursor-gw-test")) continue;
+      fs.rmSync(path.join(os.homedir(), ".cursor", "projects", slug), { recursive: true, force: true });
+    }
+  }
+  fs.rmSync(dataDir, { recursive: true, force: true });
 }

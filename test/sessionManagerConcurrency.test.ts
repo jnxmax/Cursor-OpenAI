@@ -1,0 +1,61 @@
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import pino from "pino";
+import { SessionManager } from "../src/cursor/sessionManager";
+import { openSqliteLocalAgentStore } from "../src/cursor/openSqliteLocalAgentStore";
+import { makeTestConfig } from "./helpers/testConfig";
+import { offlineCursor, request, sqliteFds } from "./helpers/offlineCursor";
+
+const log = pino({ level: "silent" });
+
+void test("B1 capacity eviction preserves late checkpoints and the terminal disk state", async (t) => {
+  const sdk = offlineCursor(t);
+  const manager = new SessionManager(makeTestConfig({ maxCachedAgents: 1 }), log);
+  t.after(() => manager.shutdown());
+  const first = await manager.resolve(request("active"));
+  const unlock = await first.mutex.acquire();
+  const run = await first.agent.send("fixture");
+  const control = sdk.controls.at(-1);
+  assert.ok(control);
+  const before = sqliteFds(first.cwd);
+  const pressure = await manager.resolve(request("pressure"));
+  pressure.release();
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  const afterEviction = sqliteFds(first.cwd);
+  await control.checkpoint();
+  const afterLateCheckpoint = sqliteFds(first.cwd);
+  control.finish();
+  const messages = [];
+  for await (const message of run.stream()) messages.push(message.type);
+  const live = await run.wait();
+  unlock();
+  first.release();
+  await manager.drain();
+  assert.deepEqual(sqliteFds(first.cwd), { index: 0, store: 0 });
+  const reopened = await openSqliteLocalAgentStore(first.cwd);
+  const disk = await reopened.runs.get({ agentId: first.agent.agentId, runId: run.id });
+  await reopened.dispose();
+  assert.deepEqual(sqliteFds(first.cwd), { index: 0, store: 0 });
+  t.diagnostic(JSON.stringify({ before, afterEviction, afterLateCheckpoint, live: live.status, disk: disk?.status, messages }));
+  assert.equal(live.status, "finished");
+  assert.equal(disk?.status, "finished", "terminal disk state must match the live run (B1)");
+  assert.deepEqual(afterEviction, before, "active store must stay owned/open until the final write");
+  assert.deepEqual(afterLateCheckpoint, before);
+});
+
+void test("B2 concurrent resolve of one key creates one agent and closes every descriptor", async (t) => {
+  offlineCursor(t);
+  const manager = new SessionManager(makeTestConfig(), log);
+  t.after(() => manager.shutdown());
+  const [first, second] = await Promise.all([manager.resolve(request("duplicate")), manager.resolve(request("duplicate"))]);
+  assert.ok(first && second);
+  first.release();
+  second.release();
+  manager.evictAll();
+  await manager.shutdown();
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  const remaining = sqliteFds(first.cwd);
+  t.diagnostic(JSON.stringify({ distinctAgents: first.agent !== second.agent, remaining }));
+  assert.equal(first.agent, second.agent, "same-key creation must be single-flight (B2)");
+  assert.deepEqual(remaining, { index: 0, store: 0 });
+});

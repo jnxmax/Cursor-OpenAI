@@ -190,62 +190,67 @@ export async function prepareGatewayTurn(
   // down) and the route's finally block; releasing a counting semaphore
   // twice would corrupt its available count. Guard so only the first call
   // counts.
+  let releaseSession = (): Promise<void> => Promise.resolve();
   let semaphoreReleased = false;
   const releaseSemaphore = (): void => {
     if (semaphoreReleased) return;
     semaphoreReleased = true;
-    rawReleaseSemaphore();
+    // Cancellation may acknowledge before SDK writes stop; retain the admission slot.
+    void releaseSession().then(rawReleaseSemaphore).catch((err: unknown) => {
+      log.error({ err }, "session quiescence failed; concurrency slot retained until shutdown");
+    });
   };
 
   let handle: SessionHandle;
   try {
     handle = await sessionManager.resolve({ apiKey, model: modelSelection, messages: rest, metadata });
+    releaseSession = () => { handle.release(); return handle.whenIdle(); };
+
+    const turn = prepareTurn({ newMessages: handle.newMessages, isFirstTurn: handle.isFirstTurn, systemPrompt });
+    const turnMessage: string | SDKUserMessage = turn.images && turn.images.length > 0 ? { text: turn.text, images: turn.images } : turn.text;
+
+    let toolCapture: ToolCallCapture | undefined;
+    let heldGate: HeldToolGate | undefined;
+    let customTools: Record<string, SDKCustomTool> | undefined;
+    const hasFunctionTools = (tools ?? []).some((tool) => tool.type === "function");
+    if (hasFunctionTools) {
+      if (config.toolBridgeEnabled && config.cursorRuntime === "local") {
+        if (config.toolBridgeMode === "hold") {
+          heldGate = new HeldToolGate();
+          customTools = heldGate.buildCustomTools(tools);
+        } else {
+          toolCapture = new ToolCallCapture();
+          customTools = buildBridgedCustomTools(tools, toolCapture);
+        }
+      } else {
+        log.warn(
+          { toolBridgeEnabled: config.toolBridgeEnabled, runtime: config.cursorRuntime },
+          "client requested tools[] but the tool-calling bridge is disabled or unavailable on this runtime; tools will be ignored",
+        );
+      }
+    }
+
+    return {
+      apiKey,
+      requestId,
+      endpoint,
+      requestedModelId,
+      resolvedModelId: modelSelection.id,
+      modelSelection,
+      messages: rest,
+      handle,
+      turnMessage,
+      customTools,
+      toolCapture,
+      heldGate,
+      releaseSemaphore,
+      log,
+      continuation: undefined,
+    };
   } catch (err) {
     releaseSemaphore();
     throw err;
   }
-
-  const turn = prepareTurn({ newMessages: handle.newMessages, isFirstTurn: handle.isFirstTurn, systemPrompt });
-  const turnMessage: string | SDKUserMessage = turn.images && turn.images.length > 0 ? { text: turn.text, images: turn.images } : turn.text;
-
-  let toolCapture: ToolCallCapture | undefined;
-  let heldGate: HeldToolGate | undefined;
-  let customTools: Record<string, SDKCustomTool> | undefined;
-  const hasFunctionTools = (tools ?? []).some((tool) => tool.type === "function");
-  if (hasFunctionTools) {
-    if (config.toolBridgeEnabled && config.cursorRuntime === "local") {
-      if (config.toolBridgeMode === "hold") {
-        heldGate = new HeldToolGate();
-        customTools = heldGate.buildCustomTools(tools);
-      } else {
-        toolCapture = new ToolCallCapture();
-        customTools = buildBridgedCustomTools(tools, toolCapture);
-      }
-    } else {
-      log.warn(
-        { toolBridgeEnabled: config.toolBridgeEnabled, runtime: config.cursorRuntime },
-        "client requested tools[] but the tool-calling bridge is disabled or unavailable on this runtime; tools will be ignored",
-      );
-    }
-  }
-
-  return {
-    apiKey,
-    requestId,
-    endpoint,
-    requestedModelId,
-    resolvedModelId: modelSelection.id,
-    modelSelection,
-    messages: rest,
-    handle,
-    turnMessage,
-    customTools,
-    toolCapture,
-    heldGate,
-    releaseSemaphore,
-    log,
-    continuation: undefined,
-  };
 }
 
 /** Converts a held-run segment into the same {@link RunOutcome} shape the rest of the pipeline (response translators, activity log) already consumes. */

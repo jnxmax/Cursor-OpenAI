@@ -9,7 +9,7 @@ import type { AgentOptions, SDKAgent } from "@cursor/sdk";
 import type { AppConfig } from "../src/config";
 import type { ChatCompletionMessage } from "../src/types/openai";
 import { SessionManager } from "../src/cursor/sessionManager";
-import { makeTestConfig } from "./helpers/testConfig";
+import { makeTestConfig, removeIsolatedCursorProjects, resolveIdleSession } from "./helpers/testConfig";
 
 function fakeAgent(agentId = "native-test-agent"): SDKAgent {
   return {
@@ -27,7 +27,6 @@ function fixture(t: TestContext, overrides: Partial<AppConfig> = {}) {
   const helper = path.join(config.cursorWorkdirRoot, "restart helper.py");
   fs.writeFileSync(helper, "# harmless fixture, never executed\n");
   const log = pino({ level: "silent" });
-  t.after(() => fs.rmSync(path.dirname(config.cursorWorkdirRoot), { recursive: true, force: true }));
   return { config, helper, log };
 }
 
@@ -51,10 +50,10 @@ function assertInstalled(options: Partial<AgentOptions>) {
 }
 
 for (const operation of ["create", "resume"]) {
-  test(`${operation} has project hook and full-bypass options before SDK invocation`, async (t) => {
+  void test(`${operation} has project hook and full-bypass options before SDK invocation`, async (t) => {
     const { config, helper, log } = fixture(t);
     const manager = new SessionManager({ ...config, cursorNativeRestartHelper: helper }, log);
-    t.after(() => manager.shutdown());
+    t.after(async () => { await manager.shutdown(); removeIsolatedCursorProjects(config.cursorWorkdirRoot); });
     let calls = 0;
     const check = (options: Partial<AgentOptions> = {}) => {
       calls += 1;
@@ -70,54 +69,54 @@ for (const operation of ["create", "resume"]) {
       return check(options);
     });
     if (operation === "resume") {
-      await manager.resolve({ apiKey: "test", model: { id: "test-model" }, messages: [], metadata: { session_id: "seed" } });
+      await resolveIdleSession(manager, { apiKey: "test", model: { id: "test-model" }, messages: [], metadata: { session_id: "seed" } });
       calls = 0;
     }
-    await manager.resolve({ apiKey: "test", model: { id: "test-model" }, messages: [],
+    await resolveIdleSession(manager, { apiKey: "test", model: { id: "test-model" }, messages: [],
       metadata: operation === "resume" ? { cursor_agent_id: "persisted-agent" } : undefined });
     assert.equal(calls, 1);
   });
 }
 
-test("cold lifecycle resume keeps the original SDK workspace", async (t) => {
+void test("cold lifecycle resume keeps the original SDK workspace", async (t) => {
   const { config, helper, log } = fixture(t);
   const configured = { ...config, cursorNativeRestartHelper: helper };
   const request = { apiKey: "test", model: { id: "test-model" }, messages: [] };
   t.mock.method(Agent, "create", () => Promise.resolve(fakeAgent()));
   const original = new SessionManager(configured, log);
-  const created = await original.resolve({ ...request, metadata: { session_id: "stable" } });
-  original.shutdown();
+  const created = await resolveIdleSession(original, { ...request, metadata: { session_id: "stable" } });
+  await original.shutdown();
   t.mock.method(Agent, "resume", (_id: string, options?: Partial<AgentOptions>) => {
     assert.equal(options?.local?.cwd, created.cwd);
     assertInstalled(options ?? {});
     return Promise.resolve(fakeAgent());
   });
   const cold = new SessionManager(configured, log);
-  t.after(() => cold.shutdown());
-  const resumed = await cold.resolve({ ...request, metadata: { cursor_agent_id: created.agent.agentId } });
+  t.after(async () => { await cold.shutdown(); removeIsolatedCursorProjects(config.cursorWorkdirRoot); });
+  const resumed = await resolveIdleSession(cold, { ...request, metadata: { cursor_agent_id: created.agent.agentId } });
   assert.equal(resumed.cwd, created.cwd);
 });
 
-test("unknown or other-key lifecycle resumes preserve SDK defaults", async (t) => {
+void test("unknown or other-key lifecycle resumes preserve SDK defaults", async (t) => {
   const { config, helper, log } = fixture(t);
   const configured = { ...config, cursorNativeRestartHelper: helper };
   const manager = new SessionManager(configured, log);
-  t.after(() => manager.shutdown());
+  t.after(async () => { await manager.shutdown(); removeIsolatedCursorProjects(config.cursorWorkdirRoot); });
   t.mock.method(Agent, "create", () => Promise.resolve(fakeAgent()));
   const request = { apiKey: "test", model: { id: "test-model" }, messages: [] };
-  await manager.resolve({ ...request, metadata: undefined });
+  await resolveIdleSession(manager, { ...request, metadata: undefined });
   t.mock.method(Agent, "resume", (_id: string, options?: Partial<AgentOptions>) => {
     assert.deepEqual(options, { apiKey: "other-key" });
     return Promise.resolve(fakeAgent());
   });
-  await manager.resolve({ ...request, apiKey: "other-key", metadata: { cursor_agent_id: "native-test-agent" } });
+  await resolveIdleSession(manager, { ...request, apiKey: "other-key", metadata: { cursor_agent_id: "native-test-agent" } });
 });
 
 for (const runtime of ["local", "cloud"] satisfies AppConfig["cursorRuntime"][]) {
-  test(`${runtime} disabled lifecycle preserves existing create and resume options`, async (t) => {
+  void test(`${runtime} disabled lifecycle preserves existing create and resume options`, async (t) => {
     const { config, helper, log } = fixture(t, { cursorRuntime: runtime });
     const manager = new SessionManager({ ...config, cursorNativeRestartHelper: runtime === "cloud" ? helper : undefined }, log);
-    t.after(() => manager.shutdown());
+    t.after(async () => { await manager.shutdown(); removeIsolatedCursorProjects(config.cursorWorkdirRoot); });
     t.mock.method(Agent, "create", (options: AgentOptions) => {
       if (runtime === "local") {
         assert.deepEqual(options.local?.settingSources, []);
@@ -134,27 +133,27 @@ for (const runtime of ["local", "cloud"] satisfies AppConfig["cursorRuntime"][])
       return Promise.resolve(fakeAgent());
     });
     const request = { apiKey: "test", model: { id: "test-model" }, messages: [] };
-    const created = await manager.resolve({ ...request, metadata: undefined });
-    const resumed = await manager.resolve({ ...request, metadata: { cursor_agent_id: "persisted-agent" } });
+    const created = await resolveIdleSession(manager, { ...request, metadata: undefined });
+    const resumed = await resolveIdleSession(manager, { ...request, metadata: { cursor_agent_id: "persisted-agent" } });
     for (const handle of [created, resumed]) assert.equal(fs.existsSync(path.join(handle.cwd, ".cursor")), false);
   });
 }
 
-test("auto cache repairs deleted hook in original cwd after key changes without recreating agent", async (t) => {
+void test("auto cache repairs deleted hook in original cwd after key changes without recreating agent", async (t) => {
   const { config, helper, log } = fixture(t);
   const manager = new SessionManager({ ...config, cursorNativeRestartHelper: helper }, log);
-  t.after(() => manager.shutdown());
+  t.after(async () => { await manager.shutdown(); removeIsolatedCursorProjects(config.cursorWorkdirRoot); });
   const create = t.mock.method(Agent, "create", () => Promise.resolve(fakeAgent()));
   const messages: ChatCompletionMessage[] = [{ role: "user", content: "hi" }];
   const request = { apiKey: "test", model: { id: "test-model" }, metadata: undefined };
-  const first = await manager.resolve({ ...request, messages });
+  const first = await resolveIdleSession(manager, { ...request, messages });
   const hooksPath = path.join(first.cwd, ".cursor", "hooks.json");
   assert.ok(fs.existsSync(hooksPath));
   const original = fs.readFileSync(hooksPath, "utf8");
   fs.unlinkSync(hooksPath);
   const history: ChatCompletionMessage[] = [...messages, { role: "assistant", content: "hello" }];
   manager.remember({ ...request, messages: history, handle: first });
-  const cached = await manager.resolve({ ...request, messages: [...history, { role: "user", content: "more" }] });
+  const cached = await resolveIdleSession(manager, { ...request, messages: [...history, { role: "user", content: "more" }] });
   assert.notEqual(cached.key, first.key);
   assert.equal(cached.cwd, first.cwd);
   assert.equal(cached.agent, first.agent);
@@ -162,13 +161,13 @@ test("auto cache repairs deleted hook in original cwd after key changes without 
   assert.equal(create.mock.callCount(), 1);
 });
 
-test("foreign hooks survive and project settings stay disabled with warning", async (t) => {
+void test("foreign hooks survive and project settings stay disabled with warning", async (t) => {
   const { config, helper, log } = fixture(t);
   const request = { apiKey: "test", model: { id: "test-model" }, messages: [], metadata: { session_id: "same" } };
   t.mock.method(Agent, "create", () => Promise.resolve(fakeAgent()));
   const baseline = new SessionManager(config, log);
-  const first = await baseline.resolve(request);
-  baseline.shutdown();
+  const first = await resolveIdleSession(baseline, request);
+  await baseline.shutdown();
   const hookDir = path.join(first.cwd, ".cursor");
   fs.mkdirSync(hookDir);
   const foreign = '{"version":1,"hooks":{"preToolUse":[{"command":"foreign"}]}}';
@@ -179,8 +178,8 @@ test("foreign hooks survive and project settings stay disabled with warning", as
     return Promise.resolve(fakeAgent());
   });
   const manager = new SessionManager({ ...config, cursorNativeRestartHelper: helper }, log);
-  t.after(() => manager.shutdown());
-  await manager.resolve(request);
+  t.after(async () => { await manager.shutdown(); removeIsolatedCursorProjects(config.cursorWorkdirRoot); });
+  await resolveIdleSession(manager, request);
   assert.equal(fs.readFileSync(path.join(hookDir, "hooks.json"), "utf8"), foreign);
   assert.equal(warn.mock.callCount(), 1);
 });

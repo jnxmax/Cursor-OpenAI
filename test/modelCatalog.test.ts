@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import pino from "pino";
 import { Cursor } from "@cursor/sdk";
 import type { SDKModel } from "@cursor/sdk";
-import { ModelCatalog } from "../src/cursor/modelCatalog";
+import { ModelCatalog, applyReasoningEffort, clampToAllowedEffort, reasoningParamsFor } from "../src/cursor/modelCatalog";
 
 const silentLog = pino({ level: "silent" });
 
@@ -446,3 +446,158 @@ test(
     },
   ),
 );
+
+/**
+ * Fixtures mirror the REAL Cursor catalog (dumped live 2026-10-12): grok-4.7
+ * carries `reasoning_effort` (low/medium/high/xhigh), claude-opus-5-5 carries
+ * `effort` (low/medium/high/xhigh/max), and some Claude variants expose a
+ * boolean `thinking` instead. Fixtures written from a guessed param name would
+ * have made the production code look correct while matching nothing.
+ */
+const grokModel: SDKModel = {
+  id: "grok-4.7",
+  displayName: "Grok 4.7",
+  parameters: [
+    {
+      id: "reasoning_effort",
+      displayName: "Effort",
+      values: [{ value: "low" }, { value: "medium" }, { value: "high" }, { value: "xhigh" }],
+    },
+  ],
+};
+const claudeModel: SDKModel = {
+  id: "claude-opus-5-5",
+  displayName: "Claude Opus 5.5",
+  parameters: [
+    {
+      id: "effort",
+      displayName: "Effort",
+      values: [{ value: "low" }, { value: "medium" }, { value: "high" }, { value: "xhigh" }, { value: "max" }],
+    },
+  ],
+};
+const thinkingModel: SDKModel = {
+  id: "claude-sonnet-5-thinking",
+  displayName: "Claude Sonnet 5 Thinking",
+  parameters: [{ id: "thinking", displayName: "Thinking", values: [{ value: "false" }, { value: "true" }] }],
+};
+const plainModel: SDKModel = { id: "plain-model", displayName: "Plain Model" };
+const thinkingCatalogModels: SDKModel[] = [grokModel, claudeModel, thinkingModel, plainModel];
+
+test(
+  "a max ask becomes reasoning_effort=xhigh on a model whose deepest level is xhigh",
+  withMockedModelsList(
+    () => Promise.resolve(thinkingCatalogModels),
+    async () => {
+      const catalog = new ModelCatalog(silentLog);
+      const result = await catalog.resolveModelSelection("key", "grok-4.7", "grok-4.7", "max");
+      assert.deepEqual(result, { id: "grok-4.7", params: [{ id: "reasoning_effort", value: "xhigh" }] });
+    },
+  ),
+);
+
+test(
+  "a max ask stays max on a model whose ladder already offers max",
+  withMockedModelsList(
+    () => Promise.resolve(thinkingCatalogModels),
+    async () => {
+      const catalog = new ModelCatalog(silentLog);
+      const result = await catalog.resolveModelSelection("key", "claude-opus-5-5", "grok-4.7", "max");
+      assert.deepEqual(result, { id: "claude-opus-5-5", params: [{ id: "effort", value: "max" }] });
+    },
+  ),
+);
+
+test(
+  "a max ask turns thinking on for a model that declares a boolean thinking parameter",
+  withMockedModelsList(
+    () => Promise.resolve(thinkingCatalogModels),
+    async () => {
+      const catalog = new ModelCatalog(silentLog);
+      const result = await catalog.resolveModelSelection("key", "claude-sonnet-5-thinking", "grok-4.7", "max");
+      assert.deepEqual(result, { id: "claude-sonnet-5-thinking", params: [{ id: "thinking", value: "true" }] });
+    },
+  ),
+);
+
+test(
+  "a none ask turns thinking off instead of leaving Cursor's default",
+  withMockedModelsList(
+    () => Promise.resolve(thinkingCatalogModels),
+    async () => {
+      const catalog = new ModelCatalog(silentLog);
+      const result = await catalog.resolveModelSelection("key", "claude-sonnet-5-thinking", "grok-4.7", "none");
+      assert.deepEqual(result, { id: "claude-sonnet-5-thinking", params: [{ id: "thinking", value: "false" }] });
+    },
+  ),
+);
+
+test(
+  "a model that declares no thinking parameter keeps its selection untouched",
+  withMockedModelsList(
+    () => Promise.resolve(thinkingCatalogModels),
+    async () => {
+      const catalog = new ModelCatalog(silentLog);
+      const result = await catalog.resolveModelSelection("key", "plain-model", "grok-4.7", "max");
+      assert.deepEqual(result, { id: "plain-model" });
+    },
+  ),
+);
+
+test(
+  "no reasoning_effort at all leaves the selection exactly as before",
+  withMockedModelsList(
+    () => Promise.resolve(thinkingCatalogModels),
+    async () => {
+      const catalog = new ModelCatalog(silentLog);
+      const result = await catalog.resolveModelSelection("key", "grok-4.7", "grok-4.7");
+      assert.deepEqual(result, { id: "grok-4.7" });
+    },
+  ),
+);
+
+test("a thinking param already pinned by the model id wins over the requested effort", () => {
+  const pinned = { id: "muse-spark-1.3", params: [{ id: "effort", value: "xhigh" }] };
+  const result = applyReasoningEffort(thinkingCatalogModels, pinned, "low");
+  assert.deepEqual(result, pinned);
+});
+
+test("an unknown model id keeps the selection untouched", () => {
+  const result = applyReasoningEffort(thinkingCatalogModels, { id: "not-in-catalog" }, "max");
+  assert.deepEqual(result, { id: "not-in-catalog" });
+});
+
+test("effort clamping never escalates, never picks none, and never invents a level", () => {
+  const ladder = ["none", "low", "medium", "high", "xhigh"];
+  assert.equal(clampToAllowedEffort("max", ladder), "xhigh");
+  assert.equal(clampToAllowedEffort("minimal", ladder), "low");
+  assert.equal(clampToAllowedEffort("high", ladder), "high");
+  assert.equal(clampToAllowedEffort("turbo", ladder), undefined);
+  assert.equal(clampToAllowedEffort("max", ["none"]), undefined);
+  assert.equal(clampToAllowedEffort("ultra", ["low", "high", "max"]), "max");
+});
+
+test("reasoningParamsFor only reports parameters the model actually declares", () => {
+  assert.deepEqual(reasoningParamsFor(grokModel, "max"), [{ id: "reasoning_effort", value: "xhigh" }]);
+  assert.deepEqual(reasoningParamsFor(claudeModel, "max"), [{ id: "effort", value: "max" }]);
+  assert.deepEqual(reasoningParamsFor(thinkingModel, "max"), [{ id: "thinking", value: "true" }]);
+  assert.deepEqual(reasoningParamsFor(plainModel, "max"), []);
+  assert.deepEqual(reasoningParamsFor(grokModel, ""), []);
+});
+
+test("the ladder is found by declared values, never by a guessed parameter name", () => {
+  const oddlyNamed: SDKModel = {
+    id: "weird-model",
+    displayName: "Weird",
+    parameters: [{ id: "depth", displayName: "Depth", values: [{ value: "low" }, { value: "high" }, { value: "max" }] }],
+  };
+  assert.deepEqual(reasoningParamsFor(oddlyNamed, "max"), [{ id: "depth", value: "max" }]);
+  assert.deepEqual(reasoningParamsFor(oddlyNamed, "medium"), [{ id: "depth", value: "low" }]);
+  // A non-ladder param (context sizes) must never be mistaken for the ladder.
+  const contextOnly: SDKModel = {
+    id: "context-only",
+    displayName: "Context Only",
+    parameters: [{ id: "context", displayName: "Context", values: [{ value: "300k" }, { value: "1m" }] }],
+  };
+  assert.deepEqual(reasoningParamsFor(contextOnly, "max"), []);
+});

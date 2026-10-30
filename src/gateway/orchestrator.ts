@@ -129,11 +129,13 @@ export async function prepareGatewayTurn(
     rawMessages: ChatCompletionMessage[];
     tools: ChatCompletionTool[] | undefined;
     metadata: ChatCompletionRequestMetadata | undefined;
+    /** Client's `reasoning_effort`; translated into Cursor thinking params when present. */
+    reasoningEffort?: string | undefined;
     requestId: string;
   },
 ): Promise<PreparedGatewayTurn> {
   const { config, log: baseLog, modelCatalog, sessionManager, semaphore, heldRunManager } = deps;
-  const { apiKey, endpoint, requestedModelId, rawMessages, tools, metadata, requestId } = params;
+  const { apiKey, endpoint, requestedModelId, rawMessages, tools, metadata, reasoningEffort, requestId } = params;
   const log = baseLog.child({ requestId });
 
   const { systemPrompt, rest } = extractSystemPrompt(rawMessages);
@@ -141,7 +143,7 @@ export async function prepareGatewayTurn(
     throw HttpError.badRequest('"messages" must include at least one non-system message', "messages");
   }
 
-  const model = await modelCatalog.resolveModelSelection(apiKey, requestedModelId, config.defaultModel);
+  const model = await modelCatalog.resolveModelSelection(apiKey, requestedModelId, config.defaultModel, reasoningEffort);
   log.info({ requestedModelId, modelSelection: model, formatted: formatModelSelection(model) }, "resolved Cursor model selection");
 
   // Quota pre-check: if the requested subscription model is marked exhausted,

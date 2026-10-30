@@ -37,6 +37,7 @@ async function handleChatCompletion(deps: GatewayDeps, req: Request, res: Respon
     rawMessages: body.messages,
     tools: body.tools,
     metadata: body.metadata,
+    reasoningEffort: body.reasoning_effort,
     requestId: req.requestId,
   });
 

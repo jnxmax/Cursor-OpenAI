@@ -181,7 +181,7 @@ matters.
 ```bash
 # 1. Deps into Hermes' venv (it has no pip; use uv - Hermes bundles one):
 #      Windows: %LOCALAPPDATA%\hermes\bin\uv.exe, venv at %LOCALAPPDATA%\hermes\hermes-agent\venv\Scripts\python.exe
-#      Linux/macOS: ~/.hermes/bin/uv, venv at ~/.hermes/hermes-agent/venv/bin/python
+#      Linux/macOS: ~/.hermes/bin/uv, venv at /Users/jnx/.hermes/mcp-venv/bin/python
 uv pip install --python <hermes-venv-python> "mem0ai>=2.0.7" ollama qdrant-client
 
 # 2. Embedding model:

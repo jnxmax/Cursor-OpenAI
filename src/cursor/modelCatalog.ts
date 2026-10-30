@@ -66,8 +66,30 @@ export class ModelCatalog {
     return fetchPromise;
   }
 
-  async resolveModelSelection(apiKey: string, requestedId: string, defaultModelId: string): Promise<ModelSelection> {
+  /**
+   * Resolves the requested model id against the Cursor catalog, then stamps
+   * the requested `reasoning_effort` onto that selection as Cursor thinking
+   * params (when the model declares them).
+   *
+   * Why this exists: `reasoning_effort` used to be parsed and then never read,
+   * so a client asking for `max` silently ran at Cursor's own default — for
+   * grok-4.7 that is `high` (xAI documents `xhigh` as the deepest level), and
+   * a Claude model without `thinking=true` simply does not think. The effort
+   * is translated, never guessed: a model whose catalog entry declares no
+   * thinking parameter keeps the selection untouched.
+   */
+  async resolveModelSelection(
+    apiKey: string,
+    requestedId: string,
+    defaultModelId: string,
+    reasoningEffort?: string,
+  ): Promise<ModelSelection> {
     const models = await this.safeList(apiKey);
+    const selection = await this.resolveBaseSelection(models, requestedId, defaultModelId);
+    return applyReasoningEffort(models, selection, reasoningEffort);
+  }
+
+  private async resolveBaseSelection(models: SDKModel[], requestedId: string, defaultModelId: string): Promise<ModelSelection> {
     const requested = requestedId.trim();
 
     // 1. Exact canonical id (NOT aliases). Apply explicit non-Fast when a
@@ -253,14 +275,103 @@ function aliasImpliesFast(alias: string, modelId: string): boolean {
 }
 
 /**
- * Builds the ModelSelection the SDK must receive. When the catalog declares a
- * `fast` parameter, `fast` is always set explicitly - omitting it lets Cursor
- * apply its own default, which for Composer is Fast.
- */
-function selectionForModel(model: SDKModel, opts: { fast: boolean }): ModelSelection {
-  if (!hasFastParam(model)) return { id: model.id };
-  return { id: model.id, params: [{ id: "fast", value: opts.fast ? "true" : "false" }] };
-}
+ /** Builds the ModelSelection the SDK must receive. When the catalog declares a
+  * `fast` parameter, `fast` is always set explicitly - omitting it lets Cursor
+  * apply its own default, which for Composer is Fast.
+  */
+ function selectionForModel(model: SDKModel, opts: { fast: boolean }): ModelSelection {
+   if (!hasFastParam(model)) return { id: model.id };
+   return { id: model.id, params: [{ id: "fast", value: opts.fast ? "true" : "false" }] };
+ }
+
+ /** Deepest-to-shallowest order of every effort ladder we translate against. */
+ const EFFORT_ORDER = ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"];
+
+ /**
+  * Maps `requested` onto a model's declared ladder, or `undefined` when the
+  * request already fits or cannot be honoured honestly.
+  *
+  * Policy mirrors Hermes's own clamp so client and proxy never disagree: never
+  * escalate the ask, never degrade to `none` (that would silently switch
+  * thinking off), and never invent a value the caller did not ask for — an
+  * unrecognized name yields `undefined` instead of a guess.
+  */
+ export function clampToAllowedEffort(requested: string, allowed: string[]): string | undefined {
+   if (allowed.includes(requested)) return requested;
+   if (!EFFORT_ORDER.includes(requested)) return undefined;
+   const candidates = allowed.filter((v) => EFFORT_ORDER.includes(v) && v !== "none");
+   if (candidates.length === 0) return undefined;
+   const below = candidates.filter((v) => EFFORT_ORDER.indexOf(v) < EFFORT_ORDER.indexOf(requested));
+   // Nothing weaker exists (e.g. `minimal` on a ladder that starts at `low`):
+   // fall back to the WEAKEST candidate. Picking the strongest here would
+   // escalate the ask — exactly what a clamp must never do.
+   if (below.length > 0) return below.reduce((a, b) => (EFFORT_ORDER.indexOf(a) > EFFORT_ORDER.indexOf(b) ? a : b));
+   return candidates.reduce((a, b) => (EFFORT_ORDER.indexOf(a) < EFFORT_ORDER.indexOf(b) ? a : b));
+   }
+
+ /**
+  * Thinking params a catalog model should receive for a requested effort.
+  *
+  * The ladder parameter is found by its DECLARED VALUES, never by id: the real
+  * Cursor catalog uses `reasoning_effort` (grok-4.7, gemini-3.8-flash), `effort`
+  * (claude-opus-5-5, muse-spark-1.3) and historically `reasoning`, so keying on
+  * a name would silently match nothing in production while passing a fixture
+  * built from the same wrong assumption. A boolean `thinking` toggle (Claude
+  * style) is set too when the model declares one — that is the only case where
+  * a param id is inspected, because a boolean carries no value to match on.
+  * Parameters the model does not declare contribute nothing: the resolver
+  * never guesses a capability Cursor did not advertise.
+  */
+ export function reasoningParamsFor(model: SDKModel, effort: string): ModelParameterValue[] {
+   const requested = effort.trim().toLowerCase();
+   if (!requested) return [];
+   const parameters = model.parameters ?? [];
+   const params: ModelParameterValue[] = [];
+
+   const ladder = parameters.find((p) => {
+     const values = (p.values ?? []).map((v) => v.value.toLowerCase());
+     return values.length > 0 && values.every((v) => EFFORT_ORDER.includes(v));
+   });
+   if (ladder) {
+     const allowed = (ladder.values ?? []).map((v) => v.value.toLowerCase());
+     const picked = clampToAllowedEffort(requested, allowed);
+     if (picked) params.push({ id: ladder.id, value: picked });
+   }
+
+   const thinking = parameters.find(
+     (p) =>
+       p.id.toLowerCase() === "thinking" &&
+       (p.values ?? []).every((v) => v.value === "true" || v.value === "false") &&
+       (p.values ?? []).some((v) => v.value === "true"),
+   );
+   if (thinking && !params.some((p) => p.id === thinking.id)) {
+     params.push({ id: thinking.id, value: requested === "none" ? "false" : "true" });
+   }
+
+   return params;
+ }
+
+ /**
+  * Returns `selection` with the effort's thinking params merged in. Params the
+  * selection already carries win (a variant-suffixed id like
+  * `muse-spark-1.3-xhigh` is a deliberate choice by whoever picked it), and an
+  * unknown model id keeps the selection untouched.
+  */
+ export function applyReasoningEffort(
+   models: SDKModel[],
+   selection: ModelSelection,
+   effort: string | undefined,
+ ): ModelSelection {
+   if (!effort) return selection;
+   const model = models.find((m) => m.id === selection.id);
+   if (!model) return selection;
+   const extra = reasoningParamsFor(model, effort);
+   if (extra.length === 0) return selection;
+   const declared = new Set((selection.params ?? []).map((p) => p.id));
+   const merged = extra.filter((p) => !declared.has(p.id));
+   if (merged.length === 0) return selection;
+   return { ...selection, params: [...(selection.params ?? []), ...merged] };
+ }
 
 /**
  * Parses a variant-suffixed model id into a parameterized {@link ModelSelection}.

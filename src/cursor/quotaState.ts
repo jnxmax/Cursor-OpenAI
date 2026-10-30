@@ -37,7 +37,7 @@ let state: QuotaState = { ...EMPTY, exhausted_since: {}, last_error: {} };
 let loaded = false;
 
 function statePath(): string {
-  return process.env.QUOTA_STATE_PATH || "/home/max/.hermes/cron/state/cursor-quota.json";
+  return process.env.QUOTA_STATE_PATH || "/Users/jnx/.hermes/cron/state/cursor-quota.json";
 }
 
 function load(): QuotaState {
